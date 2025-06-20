@@ -20,7 +20,7 @@ from diffusers_helper.hunyuan import encode_prompt_conds, vae_decode, vae_encode
 from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, soft_append_bcthw, resize_and_center_crop, state_dict_weighted_merge, state_dict_offset_merge, generate_timestamp
 from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
 from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
-from diffusers_helper.memory import cpu, gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, fake_diffusers_current_device, DynamicSwapInstaller, unload_complete_models, load_model_as_complete
+from diffusers_helper.memory import cpu, gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, fake_diffusers_current_device, DynamicSwapInstaller, unload_complete_models, load_model_as_complete, register_models_for_smart_management, smart_load_for_text_encoding, smart_load_for_vae_encoding, smart_load_for_image_encoding, smart_load_for_sampling, smart_load_for_vae_decoding, smart_load_for_multi_step, smart_unload_all, get_smart_manager_status
 from diffusers_helper.thread_utils import AsyncStream, async_run
 from diffusers_helper.gradio.progress_bar import make_progress_bar_css, make_progress_bar_html
 from transformers import SiglipImageProcessor, SiglipVisionModel
@@ -57,10 +57,19 @@ def get_auth_credentials():
 auth_credentials = get_auth_credentials()
 
 free_mem_gb = get_cuda_free_memory_gb(gpu)
-high_vram = free_mem_gb > 60
+
+# Optimized VRAM categories for container runtime
+high_vram = free_mem_gb > 40      # 40GB+ = High VRAM (keep everything on GPU)
+mid_vram = 20 <= free_mem_gb <= 40  # 20-40GB = Mid VRAM (24GB optimal, smart swapping)
+low_vram = free_mem_gb < 20       # <20GB = Low VRAM (aggressive management)
 
 print(f'Free VRAM {free_mem_gb} GB')
-print(f'High-VRAM Mode: {high_vram}')
+print(f'VRAM Category: {"High" if high_vram else "Mid" if mid_vram else "Low"}-VRAM Mode')
+
+# Container-optimized settings for 24GB GPU + 32GB RAM
+if mid_vram:
+    print('Container Runtime: Optimized for 24GB GPU + 32GB RAM')
+    print('Strategy: Keep small models on GPU, smart swap transformer only')
 
 # Global variables for models - will be loaded lazily
 text_encoder = None
@@ -108,37 +117,73 @@ def load_models_async():
         image_encoder.eval()
         transformer.eval()
 
-        if not high_vram:
+        # Container-optimized VAE settings
+        if low_vram:
             vae.enable_slicing()
             vae.enable_tiling()
+            print('Enabled VAE slicing/tiling for low VRAM')
+        elif mid_vram:
+            print('VAE using full tensors - 24GB GPU can handle it')
+        else:  # high_vram
+            print('VAE using full tensors - high VRAM mode')
 
         transformer.high_quality_fp32_output_for_inference = True
         print('transformer.high_quality_fp32_output_for_inference = True')
 
+        # Set optimal dtypes
         transformer.to(dtype=torch.bfloat16)
         vae.to(dtype=torch.float16)
         image_encoder.to(dtype=torch.float16)
         text_encoder.to(dtype=torch.float16)
         text_encoder_2.to(dtype=torch.float16)
 
+        # Disable gradients for inference
         vae.requires_grad_(False)
         text_encoder.requires_grad_(False)
         text_encoder_2.requires_grad_(False)
         image_encoder.requires_grad_(False)
         transformer.requires_grad_(False)
 
-        if not high_vram:
-            # DynamicSwapInstaller is same as huggingface's enable_sequential_offload but 3x faster
-            DynamicSwapInstaller.install_model(transformer, device=gpu)
-            DynamicSwapInstaller.install_model(text_encoder, device=gpu)
-        else:
+        # Register models for smart management (container-optimized)
+        register_models_for_smart_management(
+            text_encoder=text_encoder,
+            text_encoder_2=text_encoder_2,
+            vae=vae,
+            image_encoder=image_encoder,
+            transformer=transformer,
+            free_vram_gb=free_mem_gb
+        )
+
+        # Container-optimized initial GPU placement
+        if high_vram:
+            # High VRAM (40GB+): Keep everything on GPU
+            print('High VRAM: Loading all models to GPU')
             text_encoder.to(gpu)
             text_encoder_2.to(gpu)
             image_encoder.to(gpu)
             vae.to(gpu)
             transformer.to(gpu)
+        elif mid_vram:
+            # Mid VRAM (24GB): Smart initialization - persistent models already loaded by smart manager
+            print('Mid VRAM: Using smart model management (persistent models initialized)')
+            # DynamicSwapInstaller for large models that need swapping
+            DynamicSwapInstaller.install_model(transformer, device=gpu)
+            DynamicSwapInstaller.install_model(text_encoder, device=gpu)
+        else:  # low_vram
+            # Low VRAM (<20GB): Aggressive management
+            print('Low VRAM: Using aggressive model swapping')
+            DynamicSwapInstaller.install_model(transformer, device=gpu)
+            DynamicSwapInstaller.install_model(text_encoder, device=gpu)
+            DynamicSwapInstaller.install_model(text_encoder_2, device=gpu)
+            DynamicSwapInstaller.install_model(vae, device=gpu)
+            DynamicSwapInstaller.install_model(image_encoder, device=gpu)
         
         models_loaded = True
+        
+        # Debug: Print smart manager status for container monitoring
+        status = get_smart_manager_status()
+        print(f"Smart Manager Status: {status}")
+        
         model_loading_stream.output_queue.push(('complete', 'All Models Loaded Successfully!', 100))
         
     except Exception as e:
@@ -173,6 +218,13 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
     if not models_loaded:
         stream.output_queue.push(('error', 'Models not loaded yet! Please wait for model loading to complete.'))
         return
+    
+    # CUDA error recovery for 16GB cards
+    try:
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    except RuntimeError as e:
+        print(f"CUDA cleanup warning: {e}")
         
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
@@ -182,19 +234,13 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
     stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...'))))
 
     try:
-        # Clean GPU
-        if not high_vram:
-            unload_complete_models(
-                text_encoder, text_encoder_2, image_encoder, vae, transformer
-            )
-
         # Text encoding
-
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Text encoding ...'))))
 
+        # Container-optimized text encoding
         if not high_vram:
-            fake_diffusers_current_device(text_encoder, gpu)  # since we only encode one text - that is one model move and one encode, offload is same time consumption since it is also one load and one encode.
-            load_model_as_complete(text_encoder_2, target_device=gpu)
+            smart_load_for_text_encoding(preserved_memory_gb=gpu_memory_preservation)
+        # In high VRAM mode, models are already on GPU - no action needed
 
         llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
 
@@ -219,21 +265,15 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         input_image_pt = torch.from_numpy(input_image_np).float() / 127.5 - 1
         input_image_pt = input_image_pt.permute(2, 0, 1)[None, :, None]
 
-        # VAE encoding
+        # VAE + CLIP Vision encoding (combined for efficiency)
+        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'VAE + CLIP Vision encoding ...'))))
 
-        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'VAE encoding ...'))))
-
-        if not high_vram:
-            load_model_as_complete(vae, target_device=gpu)
+        # Container-optimized: Load both VAE and image encoder together for low VRAM
+        if low_vram:
+            smart_load_for_multi_step(['vae', 'image_encoder'], preserved_memory_gb=gpu_memory_preservation)
+        # In mid/high VRAM modes, these models are already optimally placed
 
         start_latent = vae_encode(input_image_pt, vae)
-
-        # CLIP Vision
-
-        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'CLIP Vision encoding ...'))))
-
-        if not high_vram:
-            load_model_as_complete(image_encoder, target_device=gpu)
 
         image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
         image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
@@ -265,9 +305,9 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
             print(f'section_index = {section_index}, total_latent_sections = {total_latent_sections}')
 
+            # Container-optimized transformer loading
             if not high_vram:
-                unload_complete_models()
-                move_model_to_device_with_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
+                smart_load_for_sampling(preserved_memory_gb=gpu_memory_preservation)
 
             if use_teacache:
                 transformer.initialize_teacache(enable_teacache=True, num_steps=steps)
@@ -333,9 +373,9 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             total_generated_latent_frames += int(generated_latents.shape[2])
             history_latents = torch.cat([history_latents, generated_latents.to(history_latents)], dim=2)
 
-            if not high_vram:
-                offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=8)
-                load_model_as_complete(vae, target_device=gpu)
+            # Container-optimized VAE decoding (in mid-VRAM mode, VAE is persistent on GPU)
+            if low_vram:
+                smart_load_for_vae_decoding(preserved_memory_gb=gpu_memory_preservation)
 
             real_history_latents = history_latents[:, :, -total_generated_latent_frames:, :, :]
 
@@ -348,8 +388,8 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 current_pixels = vae_decode(real_history_latents[:, :, -section_latent_frames:], vae).cpu()
                 history_pixels = soft_append_bcthw(history_pixels, current_pixels, overlapped_frames)
 
-            if not high_vram:
-                unload_complete_models()
+            # Models will be managed automatically by smart manager
+            # No need for aggressive unloading
 
             output_filename = os.path.join(outputs_folder, f'{job_id}_{total_generated_latent_frames}.mp4')
 
@@ -361,10 +401,9 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
     except:
         traceback.print_exc()
 
+        # Container-optimized error cleanup
         if not high_vram:
-            unload_complete_models(
-                text_encoder, text_encoder_2, image_encoder, vae, transformer
-            )
+            smart_unload_all()
 
     stream.output_queue.push(('end', None))
     return
@@ -446,7 +485,9 @@ with block:
                 n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=False)  # Not used
                 seed = gr.Number(label="Seed", value=31337, precision=0)
 
-                total_second_length = gr.Slider(label="Total Video Length (Seconds)", minimum=1, maximum=120, value=5, step=0.1)
+                # Container-optimized defaults for 24GB GPU + 32GB RAM
+                default_video_length = 8 if high_vram else (6 if mid_vram else 3)
+                total_second_length = gr.Slider(label="Total Video Length (Seconds)", minimum=1, maximum=120, value=default_video_length, step=0.1, info="Optimized for your GPU: longer videos possible with 24GB+ VRAM")
                 latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=False)  # Should not change
                 steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1, info='Changing this value is not recommended.')
 
@@ -454,7 +495,22 @@ with block:
                 gs = gr.Slider(label="Distilled CFG Scale", minimum=1.0, maximum=32.0, value=10.0, step=0.01, info='Changing this value is not recommended.')
                 rs = gr.Slider(label="CFG Re-Scale", minimum=0.0, maximum=1.0, value=0.0, step=0.01, visible=False)  # Should not change
 
-                gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=6, maximum=128, value=6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.")
+                # Container-optimized memory preservation based on VRAM category  
+                if high_vram:
+                    default_preservation = 2
+                    preservation_info = "High VRAM (40GB+): Use 2-3GB for optimal performance"
+                elif mid_vram:
+                    default_preservation = 3
+                    preservation_info = "Mid VRAM (24GB): Use 3-4GB. Container optimized for 24GB GPU"
+                else:
+                    default_preservation = 6
+                    preservation_info = "Low VRAM (<20GB): Use 6-8GB. Increase if you get OOM errors"
+                
+                gpu_memory_preservation = gr.Slider(
+                    label="GPU Inference Preserved Memory (GB)",
+                    minimum=2, maximum=20, value=default_preservation, step=0.1,
+                    info=preservation_info
+                )
 
                 mp4_crf = gr.Slider(label="MP4 Compression", minimum=0, maximum=100, value=16, step=1, info="Lower means better quality. 0 is uncompressed. Change to 16 if you get black outputs. ")
 
