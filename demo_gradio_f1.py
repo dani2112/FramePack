@@ -1,8 +1,8 @@
-from diffusers_helper.hf_login import login
-
 import os
 
-os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
+# Only set HF_HOME if not already set by Docker environment
+if 'HF_HOME' not in os.environ:
+    os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
 
 import gradio as gr
 import torch
@@ -46,52 +46,105 @@ high_vram = free_mem_gb > 60
 print(f'Free VRAM {free_mem_gb} GB')
 print(f'High-VRAM Mode: {high_vram}')
 
-text_encoder = LlamaModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder', torch_dtype=torch.float16).cpu()
-text_encoder_2 = CLIPTextModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder_2', torch_dtype=torch.float16).cpu()
-tokenizer = LlamaTokenizerFast.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer')
-tokenizer_2 = CLIPTokenizer.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer_2')
-vae = AutoencoderKLHunyuanVideo.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='vae', torch_dtype=torch.float16).cpu()
+# Global variables for models - will be loaded lazily
+text_encoder = None
+text_encoder_2 = None
+tokenizer = None
+tokenizer_2 = None
+vae = None
+feature_extractor = None
+image_encoder = None
+transformer = None
 
-feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='feature_extractor')
-image_encoder = SiglipVisionModel.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='image_encoder', torch_dtype=torch.float16).cpu()
+models_loaded = False
+model_loading_stream = AsyncStream()
 
-transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePack_F1_I2V_HY_20250503', torch_dtype=torch.bfloat16).cpu()
+def load_models_async():
+    """Load all models asynchronously with progress updates"""
+    global text_encoder, text_encoder_2, tokenizer, tokenizer_2, vae, feature_extractor, image_encoder, transformer, models_loaded
+    
+    try:
+        model_loading_stream.output_queue.push(('progress', 'Loading Text Encoder...', 10))
+        text_encoder = LlamaModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder', torch_dtype=torch.float16).cpu()
+        
+        model_loading_stream.output_queue.push(('progress', 'Loading Text Encoder 2...', 20))
+        text_encoder_2 = CLIPTextModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder_2', torch_dtype=torch.float16).cpu()
+        
+        model_loading_stream.output_queue.push(('progress', 'Loading Tokenizers...', 30))
+        tokenizer = LlamaTokenizerFast.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer')
+        tokenizer_2 = CLIPTokenizer.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer_2')
+        
+        model_loading_stream.output_queue.push(('progress', 'Loading VAE...', 50))
+        vae = AutoencoderKLHunyuanVideo.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='vae', torch_dtype=torch.float16).cpu()
 
-vae.eval()
-text_encoder.eval()
-text_encoder_2.eval()
-image_encoder.eval()
-transformer.eval()
+        model_loading_stream.output_queue.push(('progress', 'Loading Image Encoder...', 70))
+        feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='feature_extractor')
+        image_encoder = SiglipVisionModel.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='image_encoder', torch_dtype=torch.float16).cpu()
 
-if not high_vram:
-    vae.enable_slicing()
-    vae.enable_tiling()
+        model_loading_stream.output_queue.push(('progress', 'Loading Main Transformer...', 90))
+        transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePack_F1_I2V_HY_20250503', torch_dtype=torch.bfloat16).cpu()
 
-transformer.high_quality_fp32_output_for_inference = True
-print('transformer.high_quality_fp32_output_for_inference = True')
+        model_loading_stream.output_queue.push(('progress', 'Configuring Models...', 95))
+        
+        vae.eval()
+        text_encoder.eval()
+        text_encoder_2.eval()
+        image_encoder.eval()
+        transformer.eval()
 
-transformer.to(dtype=torch.bfloat16)
-vae.to(dtype=torch.float16)
-image_encoder.to(dtype=torch.float16)
-text_encoder.to(dtype=torch.float16)
-text_encoder_2.to(dtype=torch.float16)
+        if not high_vram:
+            vae.enable_slicing()
+            vae.enable_tiling()
 
-vae.requires_grad_(False)
-text_encoder.requires_grad_(False)
-text_encoder_2.requires_grad_(False)
-image_encoder.requires_grad_(False)
-transformer.requires_grad_(False)
+        transformer.high_quality_fp32_output_for_inference = True
+        print('transformer.high_quality_fp32_output_for_inference = True')
 
-if not high_vram:
-    # DynamicSwapInstaller is same as huggingface's enable_sequential_offload but 3x faster
-    DynamicSwapInstaller.install_model(transformer, device=gpu)
-    DynamicSwapInstaller.install_model(text_encoder, device=gpu)
-else:
-    text_encoder.to(gpu)
-    text_encoder_2.to(gpu)
-    image_encoder.to(gpu)
-    vae.to(gpu)
-    transformer.to(gpu)
+        transformer.to(dtype=torch.bfloat16)
+        vae.to(dtype=torch.float16)
+        image_encoder.to(dtype=torch.float16)
+        text_encoder.to(dtype=torch.float16)
+        text_encoder_2.to(dtype=torch.float16)
+
+        vae.requires_grad_(False)
+        text_encoder.requires_grad_(False)
+        text_encoder_2.requires_grad_(False)
+        image_encoder.requires_grad_(False)
+        transformer.requires_grad_(False)
+
+        if not high_vram:
+            # DynamicSwapInstaller is same as huggingface's enable_sequential_offload but 3x faster
+            DynamicSwapInstaller.install_model(transformer, device=gpu)
+            DynamicSwapInstaller.install_model(text_encoder, device=gpu)
+        else:
+            text_encoder.to(gpu)
+            text_encoder_2.to(gpu)
+            image_encoder.to(gpu)
+            vae.to(gpu)
+            transformer.to(gpu)
+        
+        models_loaded = True
+        model_loading_stream.output_queue.push(('complete', 'All Models Loaded Successfully!', 100))
+        
+    except Exception as e:
+        model_loading_stream.output_queue.push(('error', f'Error loading models: {str(e)}', 0))
+        traceback.print_exc()
+
+
+def start_model_loading():
+    """Start loading models in background"""
+    async_run(load_models_async)
+    
+    while True:
+        flag, message, progress = model_loading_stream.output_queue.next()
+        
+        if flag == 'progress':
+            yield gr.update(value=f"🔄 {message}", variant="secondary"), gr.update(interactive=False), make_progress_bar_html(progress, message)
+        elif flag == 'complete':
+            yield gr.update(value="✅ Models Ready!", variant="primary"), gr.update(interactive=True), make_progress_bar_html(100, message)
+            break
+        elif flag == 'error':
+            yield gr.update(value=f"❌ {message}", variant="stop"), gr.update(interactive=False), make_progress_bar_html(0, message)
+            break
 
 stream = AsyncStream()
 
@@ -101,6 +154,10 @@ os.makedirs(outputs_folder, exist_ok=True)
 
 @torch.no_grad()
 def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
+    if not models_loaded:
+        stream.output_queue.push(('error', 'Models not loaded yet! Please wait for model loading to complete.'))
+        return
+        
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
 
@@ -299,6 +356,11 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
 def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
     global stream
+    
+    if not models_loaded:
+        yield None, None, '', 'Models not loaded yet! Please wait for model loading to complete.', gr.update(interactive=False), gr.update(interactive=True)
+        return
+        
     assert input_image is not None, 'No input image!'
 
     yield None, None, '', '', gr.update(interactive=False), gr.update(interactive=True)
@@ -323,6 +385,10 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
         if flag == 'end':
             yield output_filename, gr.update(visible=False), gr.update(), '', gr.update(interactive=True), gr.update(interactive=False)
             break
+        
+        if flag == 'error':
+            yield gr.update(), gr.update(visible=False), data, '', gr.update(interactive=True), gr.update(interactive=False)
+            break
 
 
 def end_process():
@@ -340,6 +406,13 @@ css = make_progress_bar_css()
 block = gr.Blocks(css=css).queue()
 with block:
     gr.Markdown('# FramePack-F1')
+    
+    # Model loading status
+    with gr.Row():
+        with gr.Column():
+            model_status = gr.Button(value="🔄 Loading Models...", variant="secondary", interactive=False, scale=3)
+            model_progress = gr.HTML('', elem_classes='no-generating-animation')
+    
     with gr.Row():
         with gr.Column():
             input_image = gr.Image(sources='upload', type="numpy", label="Image", height=320)
@@ -348,7 +421,7 @@ with block:
             example_quick_prompts.click(lambda x: x[0], inputs=[example_quick_prompts], outputs=prompt, show_progress=False, queue=False)
 
             with gr.Row():
-                start_button = gr.Button(value="Start Generation")
+                start_button = gr.Button(value="Start Generation", interactive=False)
                 end_button = gr.Button(value="End Generation", interactive=False)
 
             with gr.Group():
@@ -376,6 +449,9 @@ with block:
             progress_bar = gr.HTML('', elem_classes='no-generating-animation')
 
     gr.HTML('<div style="text-align:center; margin-top:20px;">Share your results and find ideas at the <a href="https://x.com/search?q=framepack&f=live" target="_blank">FramePack Twitter (X) thread</a></div>')
+
+    # Start model loading when interface loads
+    block.load(start_model_loading, outputs=[model_status, start_button, model_progress])
 
     ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
