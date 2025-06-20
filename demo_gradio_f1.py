@@ -40,6 +40,22 @@ args = parser.parse_args()
 
 print(args)
 
+# Authentication setup
+def get_auth_credentials():
+    """Get authentication credentials from environment variables"""
+    username = os.environ.get('GRADIO_USERNAME', 'admin')
+    password = os.environ.get('GRADIO_PASSWORD', None)
+    
+    if password is None:
+        print("WARNING: No GRADIO_PASSWORD environment variable set. App will run without authentication!")
+        print("Set GRADIO_USERNAME and GRADIO_PASSWORD environment variables to enable password protection.")
+        return None
+    
+    print(f"Authentication enabled for user: {username}")
+    return (username, password)
+
+auth_credentials = get_auth_credentials()
+
 free_mem_gb = get_cuda_free_memory_gb(gpu)
 high_vram = free_mem_gb > 60
 
@@ -463,4 +479,5 @@ block.launch(
     server_port=args.port,
     share=args.share,
     inbrowser=args.inbrowser,
+    auth=auth_credentials,
 )
